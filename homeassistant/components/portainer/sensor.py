@@ -17,7 +17,7 @@ from homeassistant.components.sensor import (
     StateType,
 )
 from homeassistant.const import UnitOfInformation, UnitOfRatio
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import (
@@ -383,6 +383,7 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
     ds_coordinator = coordinator.docker_disk_space
     assert ds_coordinator is not None
+    known_container_sensors: set[tuple[str, str]] = set()
 
     def _async_add_new_endpoints(endpoints: list[PortainerCoordinatorData]) -> None:
         """Add new endpoint sensors."""
@@ -405,21 +406,30 @@ async def async_setup_entry(
             )
         )
 
-    def _async_add_new_containers(
-        containers: list[tuple[PortainerCoordinatorData, PortainerContainerData]],
-    ) -> None:
-        """Add new container sensors."""
-        async_add_entities(
-            PortainerContainerSensor(
-                coordinator,
-                entity_description,
-                container,
-                endpoint,
-            )
-            for (endpoint, container) in containers
-            for entity_description in CONTAINER_SENSORS
-            if entity_description.supported_fn(container)
-        )
+    @callback
+    def _async_add_supported_container_sensors() -> None:
+        """Add container sensors when their data becomes supported."""
+        entities: list[PortainerContainerSensor] = []
+        for endpoint in coordinator.data.values():
+            for container_name, container in endpoint.containers.items():
+                for entity_description in CONTAINER_SENSORS:
+                    sensor_key = (container_name, entity_description.key)
+                    if (
+                        sensor_key in known_container_sensors
+                        or not entity_description.supported_fn(container)
+                    ):
+                        continue
+                    known_container_sensors.add(sensor_key)
+                    entities.append(
+                        PortainerContainerSensor(
+                            coordinator,
+                            entity_description,
+                            container,
+                            endpoint,
+                        )
+                    )
+        if entities:
+            async_add_entities(entities)
 
     def _async_add_new_stacks(
         stacks: list[tuple[PortainerCoordinatorData, PortainerStackData]],
@@ -452,9 +462,11 @@ async def async_setup_entry(
         )
 
     coordinator.new_endpoints_callbacks.append(_async_add_new_endpoints)
-    coordinator.new_containers_callbacks.append(_async_add_new_containers)
     coordinator.new_stacks_callbacks.append(_async_add_new_stacks)
     coordinator.new_volumes_callbacks.append(_async_add_new_volumes)
+    entry.async_on_unload(
+        coordinator.async_add_listener(_async_add_supported_container_sensors)
+    )
 
     _async_add_new_endpoints(
         [
@@ -463,13 +475,7 @@ async def async_setup_entry(
             if endpoint.id in coordinator.known_endpoints
         ]
     )
-    _async_add_new_containers(
-        [
-            (endpoint, container)
-            for endpoint in coordinator.data.values()
-            for container in endpoint.containers.values()
-        ]
-    )
+    _async_add_supported_container_sensors()
     _async_add_new_stacks(
         [
             (endpoint, stack)
